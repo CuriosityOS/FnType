@@ -34,6 +34,7 @@ pub enum UiEvent {
     MonitorFailed,
     Level(f32),
     ConnChanged(bool, String),
+    ConnRefreshing(String),
     Stt(SttEvent),
     WsError(String),
     AudioError(String),
@@ -469,6 +470,17 @@ impl Coordinator {
                     self.fail(label, cx);
                 }
             }
+            UiEvent::ConnRefreshing(label) => {
+                self.connected = false;
+                self.set_status(&label);
+                if self.phase == Phase::Recording {
+                    self.phase = Phase::Connecting;
+                    self.update_overlay(cx, |s| {
+                        s.mode = Mode::Connecting;
+                        s.message = "Connecting".into();
+                    });
+                }
+            }
             UiEvent::Stt(event) => self.handle_stt(event, cx).await,
             UiEvent::WsError(message) => {
                 if matches!(
@@ -489,7 +501,11 @@ impl Coordinator {
                 if session == self.session && self.phase == Phase::Finalizing {
                     let captured = self.acc.best_text();
                     if clean(&captured).is_empty() {
-                        self.fail("No speech was detected. Nothing was inserted.".into(), cx);
+                        let _ = self.ws_tx.send(WsCmd::Reconnect);
+                        self.fail(
+                            "xAI did not return a transcript. Reconnecting—try again.".into(),
+                            cx,
+                        );
                     } else {
                         self.complete(captured, cx).await;
                     }
@@ -667,6 +683,11 @@ impl Coordinator {
         }
         self.bg.timer(Duration::from_millis(120)).await;
 
+        if inject::frontmost_app().map(|app| app.pid) != Some(target.pid) {
+            self.fail("Could not restore focus to the target app.".into(), cx);
+            return;
+        }
+
         if inject::focused_element_is_secure() {
             self.fail("FnType will not insert into a password field.".into(), cx);
             return;
@@ -684,7 +705,7 @@ impl Coordinator {
             return;
         }
 
-        inject::post_key(target.pid, inject::KEY_V, true);
+        inject::post_key(inject::KEY_V, true);
 
         let press_return = should_press_return(
             &text,
@@ -696,7 +717,7 @@ impl Coordinator {
         );
         if press_return {
             self.bg.timer(Duration::from_millis(130)).await;
-            inject::post_key(target.pid, inject::KEY_RETURN, false);
+            inject::post_key(inject::KEY_RETURN, false);
         }
 
         self.update_overlay(cx, |s| {

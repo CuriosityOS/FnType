@@ -27,7 +27,6 @@ dirs = "6"
 percent-encoding = "2"
 anyhow = "1"
 libc = "0.2"
-foreign-types = "0.5"
 
 [profile.release]
 opt-level = 2

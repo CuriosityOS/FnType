@@ -4,9 +4,8 @@ use core_foundation::base::TCFType;
 use core_foundation::boolean::CFBoolean;
 use core_foundation::dictionary::CFDictionary;
 use core_foundation::string::{CFString, CFStringRef};
-use core_graphics::event::{CGEvent, CGEventFlags};
+use core_graphics::event::{CGEvent, CGEventFlags, CGEventTapLocation};
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
-use foreign_types::ForeignType;
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
 
@@ -85,11 +84,7 @@ pub fn activate(pid: i32) -> bool {
     }
 }
 
-extern "C" {
-    fn CGEventPostToPid(pid: i32, event: *mut c_void);
-}
-
-pub fn post_key(pid: i32, keycode: u16, command: bool) {
+pub fn post_key(keycode: u16, command: bool) {
     let Ok(source) = CGEventSource::new(CGEventSourceStateID::CombinedSessionState) else {
         return;
     };
@@ -100,7 +95,7 @@ pub fn post_key(pid: i32, keycode: u16, command: bool) {
         if command {
             event.set_flags(CGEventFlags::CGEventFlagCommand);
         }
-        unsafe { CGEventPostToPid(pid, event.as_ptr().cast()) };
+        event.post(CGEventTapLocation::HID);
     }
 }
 

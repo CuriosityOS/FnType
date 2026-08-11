@@ -1,5 +1,5 @@
 use std::collections::VecDeque;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::channel::mpsc::UnboundedSender;
 use futures::{SinkExt, StreamExt};
@@ -20,11 +20,17 @@ pub struct WsConfig {
 
 pub enum WsCmd {
     Configure(WsConfig),
+    BeginUtterance,
     Audio(Vec<u8>),
     Finalize,
+    Reconnect,
 }
 
 const MAX_PENDING_BYTES: usize = 320_000; // ~10 s of audio buffered while (re)connecting
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
+const IDLE_REFRESH_AFTER: Duration = Duration::from_secs(120);
+const MAX_CONNECTION_AGE: Duration = Duration::from_secs(8 * 60);
 
 pub fn spawn(rx: UnboundedReceiver<WsCmd>, ui: UnboundedSender<UiEvent>) {
     std::thread::Builder::new()
@@ -93,6 +99,7 @@ async fn run(mut rx: UnboundedReceiver<WsCmd>, ui: UnboundedSender<UiEvent>) {
                             Some(WsCmd::Configure(new_config)) => { session.config = Some(new_config); break; }
                             Some(WsCmd::Audio(chunk)) => session.buffer_audio(chunk),
                             Some(WsCmd::Finalize) => session.finalize_pending = true,
+                            Some(WsCmd::BeginUtterance | WsCmd::Reconnect) => {}
                             None => return,
                         }
                     }
@@ -103,14 +110,24 @@ async fn run(mut rx: UnboundedReceiver<WsCmd>, ui: UnboundedSender<UiEvent>) {
             Ok(stream) => {
                 backoff = Duration::from_millis(1_200);
                 let (mut write, mut read) = stream.split();
+                let connected_at = Instant::now();
+                let mut last_audio_at = connected_at;
+                let mut last_server_at = connected_at;
+                let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                heartbeat.tick().await;
                 let mut ready = false;
+                let mut refreshing = false;
                 let mut reconfigure: Option<WsConfig> = None;
 
                 'connection: loop {
                     tokio::select! {
                         incoming = read.next() => {
                             let message = match incoming {
-                                Some(Ok(message)) => message,
+                                Some(Ok(message)) => {
+                                    last_server_at = Instant::now();
+                                    message
+                                }
                                 Some(Err(error)) => {
                                     let _ = ui.unbounded_send(UiEvent::ConnChanged(false, friendly(&error.to_string())));
                                     break 'connection;
@@ -160,8 +177,32 @@ async fn run(mut rx: UnboundedReceiver<WsCmd>, ui: UnboundedSender<UiEvent>) {
                                 _ => {}
                             }
                         }
+                        _ = heartbeat.tick() => {
+                            if last_server_at.elapsed() >= HEARTBEAT_TIMEOUT {
+                                eprintln!("fntype: xAI heartbeat timed out");
+                                let _ = ui.unbounded_send(UiEvent::ConnChanged(
+                                    false,
+                                    "xAI stopped responding. Reconnecting…".into(),
+                                ));
+                                break 'connection;
+                            }
+                            if write.send(Message::Ping(Vec::new().into())).await.is_err() {
+                                break 'connection;
+                            }
+                        }
                         cmd = rx.recv() => match cmd {
+                            Some(WsCmd::BeginUtterance) => {
+                                if connection_needs_refresh(connected_at, last_audio_at, Instant::now()) {
+                                    eprintln!("fntype: refreshing xAI connection before dictation");
+                                    refreshing = true;
+                                    let _ = ui.unbounded_send(UiEvent::ConnRefreshing(
+                                        "Refreshing xAI connection…".into(),
+                                    ));
+                                    break 'connection;
+                                }
+                            }
                             Some(WsCmd::Audio(chunk)) => {
+                                last_audio_at = Instant::now();
                                 if ready {
                                     if write.send(Message::binary(chunk)).await.is_err() { break 'connection; }
                                 } else {
@@ -169,12 +210,21 @@ async fn run(mut rx: UnboundedReceiver<WsCmd>, ui: UnboundedSender<UiEvent>) {
                                 }
                             }
                             Some(WsCmd::Finalize) => {
+                                last_audio_at = Instant::now();
                                 eprintln!("fntype: finalizing current utterance");
                                 if ready {
                                     if write.send(Message::text(r#"{"type":"Finalize"}"#)).await.is_err() { break 'connection; }
                                 } else {
                                     session.finalize_pending = true;
                                 }
+                            }
+                            Some(WsCmd::Reconnect) => {
+                                eprintln!("fntype: reconnecting after missing transcript");
+                                refreshing = true;
+                                let _ = ui.unbounded_send(UiEvent::ConnRefreshing(
+                                    "Reconnecting to xAI…".into(),
+                                ));
+                                break 'connection;
                             }
                             Some(WsCmd::Configure(new_config)) => {
                                 reconfigure = Some(new_config);
@@ -191,7 +241,7 @@ async fn run(mut rx: UnboundedReceiver<WsCmd>, ui: UnboundedSender<UiEvent>) {
 
                 if let Some(new_config) = reconfigure {
                     session.config = Some(new_config);
-                } else {
+                } else if !refreshing {
                     let _ = ui
                         .unbounded_send(UiEvent::ConnChanged(false, "Reconnecting to xAI…".into()));
                     tokio::time::sleep(Duration::from_millis(900)).await;
@@ -199,6 +249,11 @@ async fn run(mut rx: UnboundedReceiver<WsCmd>, ui: UnboundedSender<UiEvent>) {
             }
         }
     }
+}
+
+fn connection_needs_refresh(connected_at: Instant, last_audio_at: Instant, now: Instant) -> bool {
+    now.duration_since(connected_at) >= MAX_CONNECTION_AGE
+        || now.duration_since(last_audio_at) >= IDLE_REFRESH_AFTER
 }
 
 type WsStream =
@@ -252,5 +307,30 @@ fn friendly(error: &str) -> String {
         "No connection to xAI. Check your internet.".into()
     } else {
         format!("xAI connection issue: {error}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refreshes_old_or_idle_connections() {
+        let now = Instant::now();
+        assert!(!connection_needs_refresh(
+            now - Duration::from_secs(30),
+            now - Duration::from_secs(10),
+            now,
+        ));
+        assert!(connection_needs_refresh(
+            now - MAX_CONNECTION_AGE,
+            now - Duration::from_secs(10),
+            now,
+        ));
+        assert!(connection_needs_refresh(
+            now - Duration::from_secs(30),
+            now - IDLE_REFRESH_AFTER,
+            now,
+        ));
     }
 }

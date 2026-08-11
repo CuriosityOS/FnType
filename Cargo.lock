@@ -1918,7 +1918,6 @@ dependencies = [
  "core-graphics 0.24.0",
  "cpal",
  "dirs 6.0.0",
- "foreign-types",
  "futures",
  "gpui",
  "libc",

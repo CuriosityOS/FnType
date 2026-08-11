@@ -34,6 +34,7 @@ fn run(rx: Receiver<Cmd>, ws: TokioSender<WsCmd>, ui: UnboundedSender<UiEvent>) 
             Cmd::Start => {
                 _stream = None;
                 pending.lock().unwrap().clear();
+                let _ = ws.send(WsCmd::BeginUtterance);
                 match build_stream(pending.clone(), ws.clone(), ui.clone()) {
                     Ok(new_stream) => {
                         if let Err(error) = new_stream.play() {
