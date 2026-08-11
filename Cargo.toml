@@ -13,7 +13,7 @@ categories = ["gui", "multimedia::audio", "os::macos-apis"]
 gpui = { version = "0.2", features = ["runtime_shaders"] }
 cpal = "0.16"
 tokio = { version = "1", features = ["rt", "time", "sync", "net", "macros"] }
-tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-native-roots"] }
 futures = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
