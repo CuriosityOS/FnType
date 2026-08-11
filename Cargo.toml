@@ -1,0 +1,34 @@
+[package]
+name = "fntype"
+version = "0.1.0"
+edition = "2021"
+description = "Hold Fn to dictate anywhere on macOS with realtime xAI speech-to-text"
+license = "MIT"
+repository = "https://github.com/CuriosityOS/FnType"
+readme = "README.md"
+keywords = ["macos", "dictation", "speech-to-text", "gpui", "xai"]
+categories = ["gui", "multimedia::audio", "os::macos-apis"]
+
+[dependencies]
+gpui = { version = "0.2", features = ["runtime_shaders"] }
+cpal = "0.16"
+tokio = { version = "1", features = ["rt", "time", "sync", "net", "macros"] }
+tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+security-framework = "3"
+core-graphics = "0.24"
+core-foundation = "0.10"
+objc2 = "0.6"
+arboard = "3"
+tray-icon = "0.21"
+dirs = "6"
+percent-encoding = "2"
+anyhow = "1"
+libc = "0.2"
+foreign-types = "0.5"
+
+[profile.release]
+opt-level = 2
+lto = "thin"

@@ -1,0 +1,15 @@
+/target/
+/.build/
+/.DS_Store
+*.app
+*.dmg
+*.zip
+*.p12
+*.pem
+*.key
+*.crt
+.env
+.env.*
+!.env.example
+**/.xai-key
+/artifacts/
