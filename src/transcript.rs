@@ -18,12 +18,18 @@ pub fn clean(text: &str) -> String {
 
 #[derive(Default)]
 pub struct Accumulator {
+    /// Finished utterances within the current Fn-hold.
+    /// xAI can emit multiple `speech_final` events before the user releases Fn;
+    /// each one is one utterance and must not wipe earlier ones.
+    committed: String,
+    /// Chunk finals for the utterance currently in progress.
     completed: Vec<String>,
     interim: String,
 }
 
 impl Accumulator {
     pub fn reset(&mut self) {
+        self.committed.clear();
         self.completed.clear();
         self.interim.clear();
     }
@@ -33,12 +39,14 @@ impl Accumulator {
         if cleaned.is_empty() {
             return;
         }
-        if event.typ == "transcript.done" || event.speech_final == Some(true) {
-            // xAI's utterance-final event is the complete stitched transcript, so
-            // it supersedes the chunk finals accumulated while speech was active.
+        if event.typ == "transcript.done" {
+            // `done` is authoritative for the whole hold (may include corrections).
+            self.committed = cleaned;
             self.completed.clear();
-            self.completed.push(cleaned);
             self.interim.clear();
+        } else if event.speech_final == Some(true) {
+            // Utterance-final stitch for the *current* sentence/utterance only.
+            self.commit_utterance(cleaned);
         } else if event.is_final == Some(true) {
             if self.completed.last() != Some(&cleaned) {
                 self.completed.push(cleaned);
@@ -49,8 +57,31 @@ impl Accumulator {
         }
     }
 
+    fn commit_utterance(&mut self, utterance: String) {
+        if self.committed.is_empty() {
+            self.committed = utterance;
+        } else if utterance.starts_with(&self.committed) {
+            // Rare full-session re-stitch that already includes prior utterances.
+            self.committed = utterance;
+        } else if utterance == self.committed
+            || self
+                .committed
+                .ends_with(&(String::from(' ') + utterance.as_str()))
+        {
+            // Duplicate utterance-final; keep the existing session text.
+        } else {
+            self.committed = format!("{} {}", self.committed, utterance);
+        }
+        self.completed.clear();
+        self.interim.clear();
+    }
+
     pub fn preview(&self) -> String {
-        let mut parts = self.completed.clone();
+        let mut parts = Vec::new();
+        if !self.committed.is_empty() {
+            parts.push(self.committed.clone());
+        }
+        parts.extend(self.completed.iter().cloned());
         if !self.interim.is_empty() {
             parts.push(self.interim.clone());
         }
@@ -149,6 +180,41 @@ mod tests {
         };
         acc.ingest(&done);
         assert_eq!(acc.best_text(), "corrected full transcript");
+    }
+
+    #[test]
+    fn mid_hold_speech_finals_append_across_utterances() {
+        // Mirrors recent stderr.log: speech_final while Fn is still held, then more speech,
+        // then another speech_final on release. The first utterance must not be wiped.
+        let mut acc = Accumulator::default();
+        acc.ingest(&ev("read the recent logs of FnType", true, false));
+        acc.ingest(&ev("read the recent logs of FnType", true, true));
+        assert_eq!(acc.best_text(), "read the recent logs of FnType");
+
+        acc.ingest(&ev("there is an issue where the first half is cut off", false, false));
+        acc.ingest(&ev("there is an issue where the first half is cut off", true, false));
+        acc.ingest(&ev("there is an issue where the first half is cut off", true, true));
+
+        assert_eq!(
+            acc.best_text(),
+            "read the recent logs of FnType there is an issue where the first half is cut off"
+        );
+    }
+
+    #[test]
+    fn mid_hold_speech_final_keeps_following_interim_chunks() {
+        let mut acc = Accumulator::default();
+        acc.ingest(&ev("first half of the dictation", true, true));
+        acc.ingest(&ev("second half", false, false));
+        assert_eq!(
+            acc.best_text(),
+            "first half of the dictation second half"
+        );
+        acc.ingest(&ev("second half continues", true, false));
+        assert_eq!(
+            acc.best_text(),
+            "first half of the dictation second half continues"
+        );
     }
 
     #[test]

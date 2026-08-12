@@ -671,6 +671,12 @@ impl Coordinator {
         }
 
         self.phase = Phase::Inserting;
+        eprintln!(
+            "fntype: inserting {} chars into {} ({})",
+            text.chars().count(),
+            target.name,
+            target.bundle_id
+        );
         self.update_overlay(cx, |s| {
             s.mode = Mode::Success;
             s.message = "Inserting".into();
