@@ -33,12 +33,13 @@ impl Accumulator {
         if cleaned.is_empty() {
             return;
         }
-        if event.typ == "transcript.done" {
-            // `done` contains the full transcript, so it supersedes partial chunks.
+        if event.typ == "transcript.done" || event.speech_final == Some(true) {
+            // xAI's utterance-final event is the complete stitched transcript, so
+            // it supersedes the chunk finals accumulated while speech was active.
             self.completed.clear();
             self.completed.push(cleaned);
             self.interim.clear();
-        } else if event.is_final == Some(true) || event.speech_final == Some(true) {
+        } else if event.is_final == Some(true) {
             if self.completed.last() != Some(&cleaned) {
                 self.completed.push(cleaned);
             }
@@ -130,10 +131,13 @@ mod tests {
     }
 
     #[test]
-    fn keeps_chunk_finals_and_uses_done_as_authoritative() {
+    fn utterance_final_replaces_chunk_finals_with_stitched_text() {
         let mut acc = Accumulator::default();
         acc.ingest(&ev("first chunk", true, false));
-        acc.ingest(&ev("second chunk", true, true));
+        acc.ingest(&ev("second chunk", true, false));
+        assert_eq!(acc.best_text(), "first chunk second chunk");
+
+        acc.ingest(&ev("first chunk second chunk", true, true));
         assert_eq!(acc.best_text(), "first chunk second chunk");
 
         let done = SttEvent {
