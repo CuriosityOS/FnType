@@ -33,6 +33,16 @@ pub fn dictionary_path() -> PathBuf {
     config_dir().join("dictionary.txt")
 }
 
+pub fn log_dir() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join("Library/Logs/FnType")
+}
+
+pub fn lock_path() -> PathBuf {
+    config_dir().join("fntype.lock")
+}
+
 impl Settings {
     pub fn load() -> Self {
         std::fs::read_to_string(settings_path())

@@ -68,6 +68,55 @@ fn hide_from_dock() {
     }
 }
 
+/// Keep only one FnType alive. Reinstall used to leave the previous binary mapped
+/// in memory (`open -n`), so the old process kept dictating after a fix shipped.
+fn acquire_single_instance() -> Option<std::fs::File> {
+    use std::os::fd::AsRawFd;
+
+    let _ = std::fs::create_dir_all(config::config_dir());
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(config::lock_path())
+        .ok()?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return None;
+    }
+    let _ = std::io::Write::write_all(&mut (&file), format!("{}\n", std::process::id()).as_bytes());
+    Some(file)
+}
+
+/// `open` attaches stderr to /dev/null; mirror eprintln! into the usual log path.
+fn setup_file_logging() {
+    use std::os::unix::io::AsRawFd;
+
+    let dir = config::log_dir();
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(stderr_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("stderr.log"))
+    else {
+        return;
+    };
+    let Ok(stdout_file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("stdout.log"))
+    else {
+        return;
+    };
+    unsafe {
+        libc::dup2(stderr_file.as_raw_fd(), 2);
+        libc::dup2(stdout_file.as_raw_fd(), 1);
+    }
+    // `dup2` keeps its own references; the original descriptors can now close.
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--import-key-from-pasteboard") {
@@ -126,6 +175,17 @@ fn main() {
         println!("accessibility       : {}", perms.accessibility);
         return;
     }
+
+    setup_file_logging();
+    let Some(_instance_lock) = acquire_single_instance() else {
+        eprintln!("fntype: another instance is already running; exiting");
+        return;
+    };
+    eprintln!(
+        "fntype: started pid={} build={}",
+        std::process::id(),
+        env!("CARGO_PKG_VERSION")
+    );
 
     Application::new().run(|cx: &mut App| {
         hide_from_dock();
@@ -416,12 +476,7 @@ impl Coordinator {
                     window_background: WindowBackgroundAppearance::Transparent,
                     ..Default::default()
                 },
-                |_, cx| {
-                    cx.new(|cx| {
-                        cx.observe(&state, |_, _, cx| cx.notify()).detach();
-                        OverlayView { state }
-                    })
-                },
+                |window, cx| cx.new(|cx| OverlayView::new(state, window, cx)),
             )
         });
         if let Ok(Ok(handle)) = handle {

@@ -191,9 +191,21 @@ mod tests {
         acc.ingest(&ev("read the recent logs of FnType", true, true));
         assert_eq!(acc.best_text(), "read the recent logs of FnType");
 
-        acc.ingest(&ev("there is an issue where the first half is cut off", false, false));
-        acc.ingest(&ev("there is an issue where the first half is cut off", true, false));
-        acc.ingest(&ev("there is an issue where the first half is cut off", true, true));
+        acc.ingest(&ev(
+            "there is an issue where the first half is cut off",
+            false,
+            false,
+        ));
+        acc.ingest(&ev(
+            "there is an issue where the first half is cut off",
+            true,
+            false,
+        ));
+        acc.ingest(&ev(
+            "there is an issue where the first half is cut off",
+            true,
+            true,
+        ));
 
         assert_eq!(
             acc.best_text(),
@@ -206,10 +218,7 @@ mod tests {
         let mut acc = Accumulator::default();
         acc.ingest(&ev("first half of the dictation", true, true));
         acc.ingest(&ev("second half", false, false));
-        assert_eq!(
-            acc.best_text(),
-            "first half of the dictation second half"
-        );
+        assert_eq!(acc.best_text(), "first half of the dictation second half");
         acc.ingest(&ev("second half continues", true, false));
         assert_eq!(
             acc.best_text(),
