@@ -625,7 +625,6 @@ impl Coordinator {
         let Some(target) = self.target.clone() else {
             return;
         };
-        self.dict = Dictionary::load(&config::dictionary_path());
         self.acc.reset();
         self.session += 1;
         self.level = 0.0;
@@ -634,6 +633,11 @@ impl Coordinator {
         } else {
             Phase::Connecting
         };
+        // Arm the already-warm microphone before any UI or disk work so the
+        // first words after FN-down are captured.
+        let _ = self.audio_tx.send(audio::Cmd::Start);
+
+        self.dict = Dictionary::load(&config::dictionary_path());
         let connected = self.connected;
         self.update_overlay(cx, |s| {
             s.mode = if connected {
@@ -651,7 +655,6 @@ impl Coordinator {
             s.target_name = target.name.clone().into();
         });
         self.open_overlay(cx);
-        let _ = self.audio_tx.send(audio::Cmd::Start);
     }
 
     fn end_recording(&mut self, cx: &mut AsyncApp) {

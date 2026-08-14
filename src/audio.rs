@@ -1,4 +1,5 @@
-use std::sync::mpsc::Receiver;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -17,6 +18,92 @@ pub enum Cmd {
 }
 
 const CHUNK_BYTES: usize = 3_200; // 100 ms of PCM16 @ 16 kHz
+/// Local lookback so FN-down → arm latency does not clip the first phonemes.
+const PREROLL_BYTES: usize = 8_000; // 250 ms of PCM16 @ 16 kHz
+const HEALTH_INTERVAL: Duration = Duration::from_millis(400);
+const REOPEN_BACKOFF: Duration = Duration::from_secs(2);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GateOut {
+    BeginUtterance,
+    Audio(Vec<u8>),
+    Finalize,
+}
+
+/// Arms/disarms a warm microphone. Idle samples stay on-device in a short preroll.
+struct CaptureGate {
+    armed: bool,
+    preroll: Vec<u8>,
+    pending: Vec<u8>,
+}
+
+impl CaptureGate {
+    fn new() -> Self {
+        CaptureGate {
+            armed: false,
+            preroll: Vec::with_capacity(PREROLL_BYTES),
+            pending: Vec::with_capacity(CHUNK_BYTES),
+        }
+    }
+
+    fn ingest(&mut self, pcm: &[u8]) -> Vec<GateOut> {
+        if pcm.is_empty() {
+            return Vec::new();
+        }
+        if !self.armed {
+            self.preroll.extend_from_slice(pcm);
+            if self.preroll.len() > PREROLL_BYTES {
+                let excess = self.preroll.len() - PREROLL_BYTES;
+                self.preroll.drain(..excess);
+            }
+            return Vec::new();
+        }
+        self.pending.extend_from_slice(pcm);
+        self.take_full_chunks()
+    }
+
+    fn start(&mut self) -> Vec<GateOut> {
+        if self.armed {
+            return Vec::new();
+        }
+        self.armed = true;
+        let mut out = vec![GateOut::BeginUtterance];
+        if !self.preroll.is_empty() {
+            let mut preroll = std::mem::take(&mut self.preroll);
+            preroll.append(&mut self.pending);
+            self.pending = preroll;
+        }
+        out.extend(self.take_full_chunks());
+        out
+    }
+
+    fn stop_finalize(&mut self) -> Vec<GateOut> {
+        self.armed = false;
+        self.preroll.clear();
+        let mut out = Vec::new();
+        if !self.pending.is_empty() {
+            out.push(GateOut::Audio(std::mem::take(&mut self.pending)));
+        }
+        out.push(GateOut::Finalize);
+        out
+    }
+
+    fn stop_discard(&mut self) -> Vec<GateOut> {
+        self.armed = false;
+        self.pending.clear();
+        self.preroll.clear();
+        Vec::new()
+    }
+
+    fn take_full_chunks(&mut self) -> Vec<GateOut> {
+        let mut out = Vec::new();
+        while self.pending.len() >= CHUNK_BYTES {
+            let chunk: Vec<u8> = self.pending.drain(..CHUNK_BYTES).collect();
+            out.push(GateOut::Audio(chunk));
+        }
+        out
+    }
+}
 
 pub fn spawn(rx: Receiver<Cmd>, ws: TokioSender<WsCmd>, ui: UnboundedSender<UiEvent>) {
     std::thread::Builder::new()
@@ -26,42 +113,106 @@ pub fn spawn(rx: Receiver<Cmd>, ws: TokioSender<WsCmd>, ui: UnboundedSender<UiEv
 }
 
 fn run(rx: Receiver<Cmd>, ws: TokioSender<WsCmd>, ui: UnboundedSender<UiEvent>) {
-    let mut _stream: Option<cpal::Stream> = None;
-    let pending: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let gate = Arc::new(Mutex::new(CaptureGate::new()));
+    let failed = Arc::new(AtomicBool::new(false));
+    let mut stream: Option<cpal::Stream> = None;
+    let mut next_health = Instant::now() + REOPEN_BACKOFF;
 
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            Cmd::Start => {
-                _stream = None;
-                pending.lock().unwrap().clear();
-                let _ = ws.send(WsCmd::BeginUtterance);
-                match build_stream(pending.clone(), ws.clone(), ui.clone()) {
-                    Ok(new_stream) => {
-                        if let Err(error) = new_stream.play() {
-                            let _ = ui.unbounded_send(UiEvent::AudioError(error.to_string()));
-                        } else {
-                            _stream = Some(new_stream);
+    match open_stream(gate.clone(), failed.clone(), ws.clone(), ui.clone()) {
+        Ok(new_stream) => stream = Some(new_stream),
+        Err(error) => {
+            eprintln!("fntype: could not pre-open microphone: {error}");
+        }
+    }
+
+    loop {
+        match rx.recv_timeout(HEALTH_INTERVAL) {
+            Ok(Cmd::Start) => {
+                {
+                    let mut gate = gate.lock().unwrap();
+                    send_outs(&ws, gate.start());
+                }
+                if stream.is_none() {
+                    match open_stream(gate.clone(), failed.clone(), ws.clone(), ui.clone()) {
+                        Ok(new_stream) => stream = Some(new_stream),
+                        Err(error) => {
+                            let _ = ui.unbounded_send(UiEvent::AudioError(error));
                         }
                     }
-                    Err(error) => {
-                        let _ = ui.unbounded_send(UiEvent::AudioError(error));
-                    }
                 }
             }
-            Cmd::StopFinalize => {
-                _stream = None; // drop stops the CoreAudio callbacks
-                let tail = std::mem::take(&mut *pending.lock().unwrap());
-                if !tail.is_empty() {
-                    let _ = ws.send(WsCmd::Audio(tail));
-                }
-                let _ = ws.send(WsCmd::Finalize);
+            Ok(Cmd::StopFinalize) => {
+                let mut gate = gate.lock().unwrap();
+                send_outs(&ws, gate.stop_finalize());
             }
-            Cmd::StopDiscard => {
-                _stream = None;
-                pending.lock().unwrap().clear();
+            Ok(Cmd::StopDiscard) => {
+                let mut gate = gate.lock().unwrap();
+                send_outs(&ws, gate.stop_discard());
+            }
+            Err(RecvTimeoutError::Timeout) => {
+                if Instant::now() >= next_health {
+                    next_health = Instant::now() + REOPEN_BACKOFF;
+                    maybe_reopen(&mut stream, &gate, &failed, &ws, &ui);
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => return,
+        }
+    }
+}
+
+fn maybe_reopen(
+    stream: &mut Option<cpal::Stream>,
+    gate: &Arc<Mutex<CaptureGate>>,
+    failed: &Arc<AtomicBool>,
+    ws: &TokioSender<WsCmd>,
+    ui: &UnboundedSender<UiEvent>,
+) {
+    if gate.lock().unwrap().armed {
+        return;
+    }
+    let failed_now = failed.swap(false, Ordering::Relaxed);
+    if stream.is_some() && !failed_now {
+        return;
+    }
+    // Open the replacement first so a failed rebuild does not leave a hole.
+    match open_stream(gate.clone(), failed.clone(), ws.clone(), ui.clone()) {
+        Ok(new_stream) => *stream = Some(new_stream),
+        Err(error) => {
+            if stream.is_none() {
+                eprintln!("fntype: microphone reopen failed: {error}");
             }
         }
     }
+}
+
+fn send_outs(ws: &TokioSender<WsCmd>, outs: Vec<GateOut>) {
+    for out in outs {
+        match out {
+            GateOut::BeginUtterance => {
+                let _ = ws.send(WsCmd::BeginUtterance);
+            }
+            GateOut::Audio(chunk) => {
+                let _ = ws.send(WsCmd::Audio(chunk));
+            }
+            GateOut::Finalize => {
+                let _ = ws.send(WsCmd::Finalize);
+            }
+        }
+    }
+}
+
+fn open_stream(
+    gate: Arc<Mutex<CaptureGate>>,
+    failed: Arc<AtomicBool>,
+    ws: TokioSender<WsCmd>,
+    ui: UnboundedSender<UiEvent>,
+) -> Result<cpal::Stream, String> {
+    failed.store(false, Ordering::Relaxed);
+    let stream = build_stream(gate, failed, ws, ui)?;
+    stream
+        .play()
+        .map_err(|error| format!("Could not start the microphone: {error}"))?;
+    Ok(stream)
 }
 
 struct Resampler {
@@ -109,7 +260,8 @@ impl Resampler {
 }
 
 fn build_stream(
-    pending: Arc<Mutex<Vec<u8>>>,
+    gate: Arc<Mutex<CaptureGate>>,
+    failed: Arc<AtomicBool>,
     ws: TokioSender<WsCmd>,
     ui: UnboundedSender<UiEvent>,
 ) -> Result<cpal::Stream, String> {
@@ -123,15 +275,16 @@ fn build_stream(
 
     let sample_rate = supported.sample_rate().0 as f64;
     let channels = supported.channels() as usize;
+    let label = device.name().unwrap_or_else(|_| "unknown".into());
     eprintln!(
-        "fntype: microphone={} format={:?} rate={} channels={channels}",
-        device.name().unwrap_or_else(|_| "unknown".into()),
+        "fntype: microphone kept warm device={label} format={:?} rate={} channels={channels}",
         supported.sample_format(),
         supported.sample_rate().0,
     );
     let mut resampler = Resampler::new(sample_rate);
     let mut mono = Vec::<f32>::with_capacity(4_096);
     let mut resampled = Vec::<i16>::with_capacity(4_096);
+    let mut pcm_bytes = Vec::<u8>::with_capacity(8_192);
     let mut last_level = Instant::now();
     let mut sent_first_chunk = false;
 
@@ -148,7 +301,19 @@ fn build_stream(
             return;
         }
 
-        if last_level.elapsed() >= Duration::from_millis(50) {
+        resampled.clear();
+        resampler.process(&mono, &mut resampled);
+        if resampled.is_empty() {
+            return;
+        }
+
+        pcm_bytes.clear();
+        for sample in &resampled {
+            pcm_bytes.extend_from_slice(&sample.to_le_bytes());
+        }
+
+        let mut gate = gate.lock().unwrap();
+        if gate.armed && last_level.elapsed() >= Duration::from_millis(50) {
             last_level = Instant::now();
             let rms = (mono.iter().map(|s| (*s as f64) * (*s as f64)).sum::<f64>()
                 / mono.len() as f64)
@@ -161,29 +326,20 @@ fn build_stream(
             };
             let _ = ui.unbounded_send(UiEvent::Level(level));
         }
-
-        resampled.clear();
-        resampler.process(&mono, &mut resampled);
-        if resampled.is_empty() {
-            return;
-        }
-
-        let mut buffer = pending.lock().unwrap();
-        for sample in &resampled {
-            buffer.extend_from_slice(&sample.to_le_bytes());
-        }
-        while buffer.len() >= CHUNK_BYTES {
-            let chunk: Vec<u8> = buffer.drain(..CHUNK_BYTES).collect();
-            if !sent_first_chunk {
-                sent_first_chunk = true;
-                eprintln!("fntype: streaming 16 kHz PCM audio to xAI");
+        for out in gate.ingest(&pcm_bytes) {
+            if let GateOut::Audio(chunk) = out {
+                if !sent_first_chunk {
+                    sent_first_chunk = true;
+                    eprintln!("fntype: streaming 16 kHz PCM audio to xAI");
+                }
+                let _ = ws.send(WsCmd::Audio(chunk));
             }
-            let _ = ws.send(WsCmd::Audio(chunk));
         }
     };
 
     let error_handler = move |error: cpal::StreamError| {
         eprintln!("fntype audio stream error: {error}");
+        failed.store(true, Ordering::Relaxed);
     };
 
     let stream = match supported.sample_format() {
@@ -217,5 +373,106 @@ fn build_stream(
         other => return Err(format!("Unsupported microphone sample format: {other:?}")),
     };
 
-    stream.map_err(|e| format!("Could not open the microphone: {e}"))
+    let stream = stream.map_err(|e| format!("Could not open the microphone: {e}"))?;
+    Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pcm(tag: u8, n: usize) -> Vec<u8> {
+        vec![tag; n]
+    }
+
+    fn audio_bytes(out: &[GateOut]) -> Vec<u8> {
+        out.iter()
+            .filter_map(|event| match event {
+                GateOut::Audio(bytes) => Some(bytes.as_slice()),
+                _ => None,
+            })
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    #[test]
+    fn idle_samples_stay_local() {
+        let mut gate = CaptureGate::new();
+        assert!(gate.ingest(&pcm(1, CHUNK_BYTES * 2)).is_empty());
+        assert!(gate.ingest(&pcm(1, PREROLL_BYTES)).is_empty());
+        assert!(!gate.armed);
+        assert!(gate.pending.is_empty());
+    }
+
+    #[test]
+    fn preroll_drops_oldest_bytes_past_cap() {
+        let mut gate = CaptureGate::new();
+        assert!(gate.ingest(&pcm(1, PREROLL_BYTES + 64)).is_empty());
+        assert!(gate.ingest(&pcm(2, PREROLL_BYTES)).is_empty());
+        let out = gate.start();
+        assert_eq!(out.first(), Some(&GateOut::BeginUtterance));
+        let bytes = audio_bytes(&out);
+        assert!(bytes.iter().all(|b| *b == 2));
+        assert!(bytes.len() <= PREROLL_BYTES);
+        assert_eq!(bytes.len() + gate.pending.len(), PREROLL_BYTES);
+    }
+
+    #[test]
+    fn start_flushes_preroll_before_live_samples() {
+        let mut gate = CaptureGate::new();
+        assert!(gate.ingest(&pcm(1, CHUNK_BYTES)).is_empty());
+        let started = gate.start();
+        assert_eq!(started[0], GateOut::BeginUtterance);
+        assert_eq!(started[1], GateOut::Audio(pcm(1, CHUNK_BYTES)));
+        let live = gate.ingest(&pcm(2, CHUNK_BYTES));
+        assert_eq!(live, vec![GateOut::Audio(pcm(2, CHUNK_BYTES))]);
+    }
+
+    #[test]
+    fn stop_finalize_emits_tail_then_finalize() {
+        let mut gate = CaptureGate::new();
+        assert_eq!(gate.start(), vec![GateOut::BeginUtterance]);
+        assert!(gate.ingest(&pcm(3, 100)).is_empty());
+        assert_eq!(
+            gate.stop_finalize(),
+            vec![GateOut::Audio(pcm(3, 100)), GateOut::Finalize]
+        );
+        assert!(!gate.armed);
+        assert!(gate.ingest(&pcm(4, CHUNK_BYTES)).is_empty());
+    }
+
+    #[test]
+    fn stop_discard_drops_everything() {
+        let mut gate = CaptureGate::new();
+        assert!(gate.ingest(&pcm(1, CHUNK_BYTES)).is_empty());
+        let _ = gate.start();
+        let _ = gate.ingest(&pcm(2, 50));
+        assert!(gate.stop_discard().is_empty());
+        assert_eq!(gate.start(), vec![GateOut::BeginUtterance]);
+        assert_eq!(gate.stop_finalize(), vec![GateOut::Finalize]);
+    }
+
+    #[test]
+    fn start_sends_begin_utterance_before_audio() {
+        let mut gate = CaptureGate::new();
+        assert_eq!(gate.start(), vec![GateOut::BeginUtterance]);
+        assert!(gate.ingest(&pcm(9, CHUNK_BYTES - 1)).is_empty());
+        assert_eq!(
+            gate.ingest(&pcm(9, 1)),
+            vec![GateOut::Audio(pcm(9, CHUNK_BYTES))]
+        );
+    }
+
+    #[test]
+    fn armed_samples_emit_full_chunks_only() {
+        let mut gate = CaptureGate::new();
+        let _ = gate.start();
+        assert!(gate.ingest(&pcm(7, CHUNK_BYTES - 1)).is_empty());
+        assert_eq!(
+            gate.ingest(&pcm(7, 1)),
+            vec![GateOut::Audio(pcm(7, CHUNK_BYTES))]
+        );
+        assert!(gate.pending.is_empty());
+    }
 }

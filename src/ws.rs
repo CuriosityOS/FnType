@@ -186,6 +186,14 @@ async fn run(mut rx: UnboundedReceiver<WsCmd>, ui: UnboundedSender<UiEvent>) {
                                 ));
                                 break 'connection;
                             }
+                            // Only refresh when the socket has been idle. Max-age
+                            // reconnects wait for the next BeginUtterance so a long
+                            // hold is not torn down mid-speech.
+                            if last_audio_at.elapsed() >= IDLE_REFRESH_AFTER {
+                                eprintln!("fntype: refreshing idle xAI connection");
+                                refreshing = true;
+                                break 'connection;
+                            }
                             if write.send(Message::Ping(Vec::new().into())).await.is_err() {
                                 break 'connection;
                             }
