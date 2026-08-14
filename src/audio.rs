@@ -30,7 +30,7 @@ enum GateOut {
     Finalize,
 }
 
-/// Arms/disarms a warm microphone. Idle samples stay on-device in a short preroll.
+/// Arms/disarms capture. Idle samples stay on-device in a short preroll.
 struct CaptureGate {
     armed: bool,
     preroll: Vec<u8>,
@@ -118,13 +118,6 @@ fn run(rx: Receiver<Cmd>, ws: TokioSender<WsCmd>, ui: UnboundedSender<UiEvent>) 
     let mut stream: Option<cpal::Stream> = None;
     let mut next_health = Instant::now() + REOPEN_BACKOFF;
 
-    match open_stream(gate.clone(), failed.clone(), ws.clone(), ui.clone()) {
-        Ok(new_stream) => stream = Some(new_stream),
-        Err(error) => {
-            eprintln!("fntype: could not pre-open microphone: {error}");
-        }
-    }
-
     loop {
         match rx.recv_timeout(HEALTH_INTERVAL) {
             Ok(Cmd::Start) => {
@@ -142,17 +135,23 @@ fn run(rx: Receiver<Cmd>, ws: TokioSender<WsCmd>, ui: UnboundedSender<UiEvent>) 
                 }
             }
             Ok(Cmd::StopFinalize) => {
-                let mut gate = gate.lock().unwrap();
-                send_outs(&ws, gate.stop_finalize());
+                {
+                    let mut gate = gate.lock().unwrap();
+                    send_outs(&ws, gate.stop_finalize());
+                }
+                stream = None;
             }
             Ok(Cmd::StopDiscard) => {
-                let mut gate = gate.lock().unwrap();
-                send_outs(&ws, gate.stop_discard());
+                {
+                    let mut gate = gate.lock().unwrap();
+                    send_outs(&ws, gate.stop_discard());
+                }
+                stream = None;
             }
             Err(RecvTimeoutError::Timeout) => {
                 if Instant::now() >= next_health {
                     next_health = Instant::now() + REOPEN_BACKOFF;
-                    maybe_reopen(&mut stream, &gate, &failed, &ws, &ui);
+                    recover_or_release(&mut stream, &gate, &failed, &ws, &ui);
                 }
             }
             Err(RecvTimeoutError::Disconnected) => return,
@@ -160,27 +159,29 @@ fn run(rx: Receiver<Cmd>, ws: TokioSender<WsCmd>, ui: UnboundedSender<UiEvent>) 
     }
 }
 
-fn maybe_reopen(
+fn recover_or_release(
     stream: &mut Option<cpal::Stream>,
     gate: &Arc<Mutex<CaptureGate>>,
     failed: &Arc<AtomicBool>,
     ws: &TokioSender<WsCmd>,
     ui: &UnboundedSender<UiEvent>,
 ) {
-    if gate.lock().unwrap().armed {
+    let armed = gate.lock().unwrap().armed;
+    if !armed {
+        if stream.is_some() {
+            *stream = None;
+        }
+        failed.store(false, Ordering::Relaxed);
         return;
     }
-    let failed_now = failed.swap(false, Ordering::Relaxed);
-    if stream.is_some() && !failed_now {
+    if !failed.swap(false, Ordering::Relaxed) && stream.is_some() {
         return;
     }
-    // Open the replacement first so a failed rebuild does not leave a hole.
     match open_stream(gate.clone(), failed.clone(), ws.clone(), ui.clone()) {
         Ok(new_stream) => *stream = Some(new_stream),
         Err(error) => {
-            if stream.is_none() {
-                eprintln!("fntype: microphone reopen failed: {error}");
-            }
+            eprintln!("fntype: microphone reopen failed: {error}");
+            let _ = ui.unbounded_send(UiEvent::AudioError(error));
         }
     }
 }
@@ -277,7 +278,7 @@ fn build_stream(
     let channels = supported.channels() as usize;
     let label = device.name().unwrap_or_else(|_| "unknown".into());
     eprintln!(
-        "fntype: microphone kept warm device={label} format={:?} rate={} channels={channels}",
+        "fntype: microphone opened device={label} format={:?} rate={} channels={channels}",
         supported.sample_format(),
         supported.sample_rate().0,
     );

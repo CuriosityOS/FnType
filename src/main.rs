@@ -633,8 +633,8 @@ impl Coordinator {
         } else {
             Phase::Connecting
         };
-        // Arm the already-warm microphone before any UI or disk work so the
-        // first words after FN-down are captured.
+        // Open the mic before overlay/dictionary work so capture starts as
+        // soon as FN is down. The stream is closed again on FN-up.
         let _ = self.audio_tx.send(audio::Cmd::Start);
 
         self.dict = Dictionary::load(&config::dictionary_path());
