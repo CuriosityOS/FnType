@@ -175,7 +175,7 @@ FNTYPE_SIGNING_IDENTITY="My Signing Identity" ./scripts/bundle.sh
 
 | Module | Responsibility |
 | --- | --- |
-| `audio.rs` | Microphone capture, mono downmix, resampling, PCM framing |
+| `audio.rs` | Microphone capture, device selection, mono downmix, resampling, PCM framing |
 | `ws.rs` | Warm xAI WebSocket, buffering, reconnect, STT events |
 | `fn_monitor.rs` | Global Fn/Globe monitor and missed-release watchdog |
 | `overlay.rs` | Compact monochrome GPUI waveform |
@@ -194,6 +194,10 @@ Remove and re-add `/Applications/FnType.app` under **Privacy & Security → Inpu
 ### The waveform moves but no text appears
 
 Open the **fn** menu and confirm the status says `xAI realtime ready`. Verify that the API key has Voice access and available credit.
+
+### Dictation is empty, or music sounds tinny, while AirPods are connected
+
+macOS makes AirPods the default microphone. Opening that mic switches them into low-quality call mode and can silence dictation. FnType captures from the Mac's built-in mic instead and temporarily points the system default input there so playback stays in high-quality mode. If the lid is closed or no other mic exists, AirPods are used.
 
 ### Permissions reset after rebuilding
 

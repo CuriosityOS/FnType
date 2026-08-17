@@ -5,6 +5,7 @@ mod fn_monitor;
 mod inject;
 mod keychain;
 mod overlay;
+mod sys_audio;
 mod transcript;
 mod ws;
 
