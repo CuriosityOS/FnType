@@ -11,7 +11,7 @@ categories = ["gui", "multimedia::audio", "os::macos-apis"]
 
 [dependencies]
 gpui = { version = "0.2", features = ["runtime_shaders"] }
-cpal = "0.16"
+cpal = "0.18"
 tokio = { version = "1", features = ["rt", "time", "sync", "net", "macros"] }
 tokio-tungstenite = { version = "0.27", features = ["rustls-tls-native-roots"] }
 futures = "0.3"
